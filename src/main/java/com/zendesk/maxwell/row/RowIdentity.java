@@ -79,6 +79,22 @@ public class RowIdentity implements Serializable {
 		g.writeEndArray();
 	}
 
+	public String toFallbackValueWithReason(String reason) throws IOException {
+		JsonGenerator g = MaxwellJson.createJsonGenerator(jsonFactory, threadLocalBuffer.reset());
+		writeStartCommon(g);
+
+		g.writeStringField(FieldNames.REASON, reason);
+
+		g.writeObjectFieldStart(FieldNames.DATA);
+		for (Map.Entry<String,Object> pk : primaryKeyColumns) {
+			writePrimaryKey(g, pk);
+		}
+		g.writeEndObject(); // end of 'data: { }'
+
+		writeEndCommon(g);
+		return threadLocalBuffer.consume();
+	}
+
 	public String toConcatString() {
 		if (primaryKeyColumns.isEmpty()) {
 			return database + table;

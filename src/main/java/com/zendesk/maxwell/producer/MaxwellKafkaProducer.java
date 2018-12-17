@@ -5,6 +5,7 @@ import com.codahale.metrics.Meter;
 import com.zendesk.maxwell.MaxwellContext;
 import com.zendesk.maxwell.producer.partitioners.MaxwellKafkaPartitioner;
 import com.zendesk.maxwell.replication.Position;
+import com.zendesk.maxwell.row.RowIdentity;
 import com.zendesk.maxwell.row.RowMap;
 import com.zendesk.maxwell.row.RowMap.KeyFormat;
 import com.zendesk.maxwell.schema.ddl.DDLMap;
@@ -25,49 +26,84 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeoutException;
 
 class KafkaCallback implements Callback {
+	static class ProducerContext {
+		// standard references we pass to all callbacks from the publisher
+		public Counter producedMessageCount;
+		public Counter failedMessageCount;
+		public Meter producedMessageMeter;
+		public Meter failedMessageMeter;
+		public MaxwellKafkaProducerWorker producer;
+		public String fallbackTopic;
+		public MaxwellContext maxwell;
+
+		public ProducerContext(MaxwellKafkaProducerWorker producer,
+		                       MaxwellContext maxwell,
+		                       String fallbackTopic,
+		                       Counter producedMessageCount, Counter failedMessageCount,
+		                       Meter producedMessageMeter, Meter failedMessageMeter
+		) {
+			this.producedMessageCount = producedMessageCount;
+			this.failedMessageCount = failedMessageCount;
+			this.producedMessageMeter = producedMessageMeter;
+			this.failedMessageMeter = failedMessageMeter;
+			this.producer = producer;
+			this.fallbackTopic = fallbackTopic;
+			this.maxwell = maxwell;
+		}
+
+		public ProducerContext withoutFallbackTopic() {
+			return new ProducerContext(producer, maxwell, null,
+				producedMessageCount, failedMessageCount, producedMessageMeter, failedMessageMeter);
+		}
+	}
+
 	public static final Logger LOGGER = LoggerFactory.getLogger(MaxwellKafkaProducer.class);
 	private final AbstractAsyncProducer.CallbackCompleter cc;
 	private final Position position;
 	private final String json;
-	private final String key;
-	private final MaxwellContext context;
+	private final RowIdentity key;
+	private final ProducerContext context;
 
-	private Counter succeededMessageCount;
-	private Counter failedMessageCount;
-	private Meter succeededMessageMeter;
-	private Meter failedMessageMeter;
-
-	public KafkaCallback(AbstractAsyncProducer.CallbackCompleter cc, Position position, String key, String json,
-	                     Counter producedMessageCount, Counter failedMessageCount, Meter producedMessageMeter,
-	                     Meter failedMessageMeter, MaxwellContext context) {
+	public KafkaCallback(AbstractAsyncProducer.CallbackCompleter cc, Position position,
+	                     RowIdentity key, String json, ProducerContext context) {
 		this.cc = cc;
 		this.position = position;
 		this.key = key;
 		this.json = json;
-		this.succeededMessageCount = producedMessageCount;
-		this.failedMessageCount = failedMessageCount;
-		this.succeededMessageMeter = producedMessageMeter;
-		this.failedMessageMeter = failedMessageMeter;
 		this.context = context;
+	}
+
+	private KafkaCallback withContext(ProducerContext context) {
+		return new KafkaCallback(cc, position, key, json, context);
+	}
+
+	ProducerContext getContext() {
+		return context;
 	}
 
 	@Override
 	public void onCompletion(RecordMetadata md, Exception e) {
 		if ( e != null ) {
-			this.failedMessageCount.inc();
-			this.failedMessageMeter.mark();
+			context.failedMessageCount.inc();
+			context.failedMessageMeter.mark();
 
 			LOGGER.error(e.getClass().getSimpleName() + " @ " + position + " -- " + key);
 			LOGGER.error(e.getLocalizedMessage());
-			if ( e instanceof RecordTooLargeException ) {
-				LOGGER.error("Considering raising max.request.size broker-side.");
-			} else if (!this.context.getConfig().ignoreProducerError) {
-				this.context.terminate(e);
-				return;
+
+			boolean nonFatal = e instanceof RecordTooLargeException || context.maxwell.getConfig().ignoreProducerError;
+
+			if (nonFatal) {
+				if (context.fallbackTopic == null) {
+					cc.markCompleted();
+				} else {
+					publishFallback(md, e);
+				}
+			} else {
+				context.maxwell.terminate(e);
 			}
 		} else {
-			this.succeededMessageCount.inc();
-			this.succeededMessageMeter.mark();
+			context.producedMessageCount.inc();
+			context.producedMessageMeter.mark();
 
 			if (LOGGER.isDebugEnabled()) {
 				LOGGER.debug("->  key:" + key + ", partition:" + md.partition() + ", offset:" + md.offset());
@@ -75,10 +111,22 @@ class KafkaCallback implements Callback {
 				LOGGER.debug("   " + position);
 				LOGGER.debug("");
 			}
+			cc.markCompleted();
 		}
-
-		cc.markCompleted();
 	}
+
+	private void publishFallback(RecordMetadata md, Exception e) {
+		// When publishing a fallback record, make a callback
+		// with no fallback topic to avoid infinite loops
+		ProducerContext fallbackContext = context.withoutFallbackTopic();
+		KafkaCallback cb = this.withContext(fallbackContext);
+		try {
+			context.producer.sendFallbackAsync(context.fallbackTopic, key, cb, e);
+		} catch (Exception fallbackEx) {
+			cb.onCompletion(md, fallbackEx);
+		}
+	}
+
 }
 
 public class MaxwellKafkaProducer extends AbstractProducer {
@@ -114,7 +162,7 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 	static final Logger LOGGER = LoggerFactory.getLogger(MaxwellKafkaProducer.class);
 
 	private final KafkaProducer<String, String> kafka;
-	private String topic;
+	private final String topic;
 	private final String ddlTopic;
 	private final MaxwellKafkaPartitioner partitioner;
 	private final MaxwellKafkaPartitioner ddlPartitioner;
@@ -123,6 +171,8 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 	private final ArrayBlockingQueue<RowMap> queue;
 	private Thread thread;
 	private StoppableTaskState taskState;
+
+	private final KafkaCallback.ProducerContext producerContext;
 
 	public static MaxwellKafkaPartitioner makeDDLPartitioner(String partitionHashFunc, String partitionKey) {
 		if ( partitionKey.equals("table") ) {
@@ -135,9 +185,10 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 	public MaxwellKafkaProducerWorker(MaxwellContext context, Properties kafkaProperties, String kafkaTopic, ArrayBlockingQueue<RowMap> queue) {
 		super(context);
 
-		this.topic = kafkaTopic;
-		if ( this.topic == null ) {
+		if ( kafkaTopic == null ) {
 			this.topic = "maxwell";
+		} else {
+			this.topic = kafkaTopic;
 		}
 
 		this.interpolateTopic = this.topic.contains("%{");
@@ -156,6 +207,9 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 			keyFormat = KeyFormat.HASH;
 		else
 			keyFormat = KeyFormat.ARRAY;
+
+		this.producerContext = new KafkaCallback.ProducerContext(this, context, context.getConfig().deadLetterTopic,
+				succeededMessageCount, failedMessageCount, succeededMessageMeter, failedMessageMeter);
 
 		this.queue = queue;
 		this.taskState = new StoppableTaskState("MaxwellKafkaProducerWorker");
@@ -189,9 +243,9 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 		}
 	}
 
-	private String generateTopic(String topic, RowMap r){
+	private String generateTopic(String topic, RowIdentity pk){
 		if ( interpolateTopic )
-			return topic.replaceAll("%\\{database\\}", r.getDatabase()).replaceAll("%\\{table\\}", r.getTable());
+			return topic.replaceAll("%\\{database\\}", pk.getDatabase()).replaceAll("%\\{table\\}", pk.getTable());
 		else
 			return topic;
 	}
@@ -203,17 +257,22 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 		/* if debug logging isn't enabled, release the reference to `value`, which can ease memory pressure somewhat */
 		String value = KafkaCallback.LOGGER.isDebugEnabled() ? record.value() : null;
 
-		KafkaCallback callback = new KafkaCallback(cc, r.getNextPosition(), record.key(), value,
-				this.succeededMessageCount, this.failedMessageCount, this.succeededMessageMeter, this.failedMessageMeter, this.context);
+		KafkaCallback callback = new KafkaCallback(cc, r.getNextPosition(), r.getRowIdentity(), value, this.producerContext);
 
 		sendAsync(record, callback);
 	}
 
-	void sendAsync(ProducerRecord<String, String> record, Callback callback) throws Exception {
+	public void sendFallbackAsync(String topic, RowIdentity fallbackRecord, KafkaCallback callback, Exception reason) throws Exception {
+		ProducerRecord<String, String> record = makeFallbackRecord(topic, fallbackRecord, reason);
+		sendAsync(record, callback);
+	}
+
+	void sendAsync(ProducerRecord<String, String> record, Callback callback) {
 		kafka.send(record, callback);
 	}
 
 	ProducerRecord<String, String> makeProducerRecord(final RowMap r) throws Exception {
+		RowIdentity pk = r.getRowIdentity();
 		String key = r.pkToJson(keyFormat);
 		String value = r.toJSON(outputConfig);
 		ProducerRecord<String, String> record;
@@ -224,12 +283,20 @@ class MaxwellKafkaProducerWorker extends AbstractAsyncProducer implements Runnab
 
 			// javascript topic override
 			topic = r.getKafkaTopic();
-			if ( topic == null )
-				topic = generateTopic(this.topic, r);
+			if ( topic == null ) {
+				topic = generateTopic(this.topic, pk);
+			}
 
 			record = new ProducerRecord<>(topic, this.partitioner.kafkaPartition(r, getNumPartitions(topic)), key, value);
 		}
 		return record;
+	}
+
+	ProducerRecord<String, String> makeFallbackRecord(String fallbackTopic, final RowIdentity pk, Exception reason) throws Exception {
+		String key = pk.toKeyJson(keyFormat);
+		String value = pk.toFallbackValueWithReason(reason.getClass().getSimpleName());
+		String topic = generateTopic(fallbackTopic, pk);
+		return new ProducerRecord<>(topic, key, value);
 	}
 
 	@Override

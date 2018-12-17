@@ -5,12 +5,9 @@ import com.zendesk.maxwell.producer.EncryptionMode;
 import com.zendesk.maxwell.replication.BinlogPosition;
 import com.zendesk.maxwell.producer.MaxwellOutputConfig;
 import com.zendesk.maxwell.replication.Position;
-import com.zendesk.maxwell.scripting.Scripting;
-import jdk.nashorn.api.scripting.ScriptObjectMirror;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.Serializable;
 import java.security.NoSuchAlgorithmException;
@@ -24,10 +21,6 @@ import java.util.regex.Pattern;
 
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonGenerator;
-
-import javax.script.ScriptEngine;
-import javax.script.ScriptEngineManager;
-import javax.script.ScriptException;
 
 
 public class RowMap implements Serializable {
@@ -65,16 +58,10 @@ public class RowMap implements Serializable {
 
 	private long approximateSize;
 
-	private static final ThreadLocal<ByteArrayOutputStream> byteArrayThreadLocal =
-			new ThreadLocal<ByteArrayOutputStream>(){
-				@Override
-				protected ByteArrayOutputStream initialValue() {
-					return new ByteArrayOutputStream();
-				}
-			};
+	private static final ThreadLocalBuffer byteArrayThreadLocal = new ThreadLocalBuffer();
 
 	private static JsonGenerator resetJsonGenerator() {
-		byteArrayThreadLocal.get().reset();
+		byteArrayThreadLocal.reset();
 		return jsonGeneratorThreadLocal.get();
 	}
 
@@ -82,15 +69,12 @@ public class RowMap implements Serializable {
 			new ThreadLocal<JsonGenerator>() {
 				@Override
 				protected JsonGenerator initialValue() {
-					JsonGenerator g = null;
 					try {
-						g = jsonFactory.createGenerator(byteArrayThreadLocal.get());
+						return MaxwellJson.createJsonGenerator(jsonFactory, byteArrayThreadLocal.get());
 					} catch (IOException e) {
 						LOGGER.error("error initializing jsonGenerator", e);
 						return null;
 					}
-					g.setRootValueSeparator(null);
-					return g;
 				}
 			};
 
@@ -167,13 +151,13 @@ public class RowMap implements Serializable {
 				if ( data.containsKey(pk) )
 					pkValue = data.get(pk);
 
-				writeValueToJSON(g, true, "pk." + pk.toLowerCase(), pkValue);
+				MaxwellJson.writeValueToJSON(g, true, "pk." + pk.toLowerCase(), pkValue);
 			}
 		}
 
 		g.writeEndObject(); // end of 'data: { }'
 		g.flush();
-		return jsonFromStream();
+		return byteArrayThreadLocal.consume();
 	}
 
 	private String pkToJsonArray() throws IOException {
@@ -190,13 +174,13 @@ public class RowMap implements Serializable {
 				pkValue = data.get(pk);
 
 			g.writeStartObject();
-			writeValueToJSON(g, true, pk.toLowerCase(), pkValue);
+			MaxwellJson.writeValueToJSON(g, true, pk.toLowerCase(), pkValue);
 			g.writeEndObject();
 		}
 		g.writeEndArray();
 		g.writeEndArray();
 		g.flush();
-		return jsonFromStream();
+		return byteArrayThreadLocal.consume();
 	}
 
 	public String pkAsConcatString() {
@@ -240,38 +224,10 @@ public class RowMap implements Serializable {
 		for (String key : data.keySet()) {
 			Object value = data.get(key);
 
-			writeValueToJSON(g, includeNullField, key, value);
+			MaxwellJson.writeValueToJSON(g, includeNullField, key, value);
 		}
 
 		g.writeEndObject(); // end of 'jsonMapName: { }'
-	}
-
-	private void writeValueToJSON(JsonGenerator g, boolean includeNullField, String key, Object value) throws IOException {
-		if (value == null && !includeNullField)
-			return;
-
-		if (value instanceof ScriptObjectMirror) {
-			try {
-				String json = Scripting.stringify((ScriptObjectMirror) value);
-				writeValueToJSON(g, includeNullField, key, new RawJSONString(json));
-			} catch (ScriptException e) {
-				LOGGER.error("error stringifying json object:", e);
-			}
-		} else if (value instanceof List) { // sets come back from .asJSON as lists, and jackson can't deal with lists natively.
-			List stringList = (List) value;
-
-			g.writeArrayFieldStart(key);
-			for (Object s : stringList) {
-				g.writeObject(s);
-			}
-			g.writeEndArray();
-		} else if (value instanceof RawJSONString) {
-			// JSON column type, using binlog-connector's serializers.
-			g.writeFieldName(key);
-			g.writeRawValue(((RawJSONString) value).json);
-		} else {
-			g.writeObjectField(key, value);
-		}
 	}
 
 	public String toJSON() throws Exception {
@@ -320,7 +276,7 @@ public class RowMap implements Serializable {
 		}
 
 		if ( outputConfig.includesSchemaId && this.schemaId != null ) {
-			 g.writeNumberField(FieldNames.SCHEMA_ID, this.schemaId);
+			g.writeNumberField(FieldNames.SCHEMA_ID, this.schemaId);
 		}
 
 		for ( Map.Entry<String, Object> entry : this.extraAttributes.entrySet() ) {
@@ -364,18 +320,12 @@ public class RowMap implements Serializable {
 		g.flush();
 
 		if(outputConfig.encryptionMode == EncryptionMode.ENCRYPT_ALL){
-			String plaintext = jsonFromStream();
+			String plaintext = byteArrayThreadLocal.consume();
 			encryptingJsonGeneratorThreadLocal.get().writeEncryptedObject(plaintext, encryptionContext);
 			g.flush();
 		}
-		return jsonFromStream();
-	}
 
-	private String jsonFromStream() {
-		ByteArrayOutputStream b = byteArrayThreadLocal.get();
-		String s = b.toString();
-		b.reset();
-		return s;
+		return byteArrayThreadLocal.consume();
 	}
 
 	public Object getData(String key) {
